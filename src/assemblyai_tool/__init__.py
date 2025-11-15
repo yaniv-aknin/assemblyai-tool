@@ -8,6 +8,7 @@ import sys
 import code
 import json
 from enum import Enum
+from importlib.metadata import version, PackageNotFoundError
 
 app = typer.Typer()
 
@@ -424,8 +425,23 @@ def delete(
         raise typer.Exit(1)
 
 
+def version_callback(value: bool) -> None:
+    if value:
+        try:
+            pkg_version = version("assemblyai-tool")
+        except PackageNotFoundError:
+            pkg_version = "unknown"
+        print(f"aait {pkg_version}")
+        raise typer.Exit()
+
+
 @app.callback()
-def callback() -> None:
+def callback(
+    version_flag: t.Annotated[
+        t.Optional[bool],
+        typer.Option("--version", callback=version_callback, is_eager=True, help="Show version and exit")
+    ] = None,
+) -> None:
     """CLI tool for AssemblyAI"""
     try:
         aai.settings.api_key = load_api_key()
