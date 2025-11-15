@@ -204,7 +204,7 @@ def format_output(
     elif output_format == OutputFormat.json_format:
         return json.dumps(transcript.json_response, indent=2)
 
-    else:  # utterances (default)
+    elif transcript.utterances:
         output = []
         for utterance in transcript.utterances:
             if speaker_labels:
@@ -212,6 +212,9 @@ def format_output(
             else:
                 output.append(f"{utterance.text}\n")
         return "\n".join(output)
+
+    else:
+        return transcript.text
 
 
 @app.command()
