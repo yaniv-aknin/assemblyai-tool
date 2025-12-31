@@ -9,6 +9,10 @@ import code
 import json
 from enum import Enum
 from importlib.metadata import version, PackageNotFoundError
+import threading
+import time
+import httpx
+from tqdm import tqdm
 
 app = typer.Typer()
 
@@ -97,6 +101,97 @@ def parse_custom_spelling(spelling_str: str) -> dict:
     return result
 
 
+_upload_progress_bars = threading.local()
+
+
+def _get_upload_progress_bar() -> t.Optional[tqdm]:
+    """Get the thread-local upload progress bar."""
+    return getattr(_upload_progress_bars, "bar", None)
+
+
+def _set_upload_progress_bar(bar: t.Optional[tqdm]) -> None:
+    """Set the thread-local upload progress bar."""
+    _upload_progress_bars.bar = bar
+
+
+class _ProgressFileReader:
+    """Wrapper that tracks read progress for file uploads."""
+
+    def __init__(self, file_path: str, progress_bar: t.Optional[tqdm]):
+        self.file = open(file_path, "rb")
+        self.progress_bar = progress_bar
+        self.size = os.path.getsize(file_path)
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.file.read(size)
+        if self.progress_bar and data:
+            self.progress_bar.update(len(data))
+        return data
+
+    def __iter__(self):
+        chunk_size = 8192
+        while True:
+            chunk = self.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+    def close(self):
+        self.file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def upload_file_with_progress(inpath: str, show_progress: bool) -> str:
+    """Upload a file to AssemblyAI with progress tracking."""
+    file_size = os.path.getsize(inpath)
+
+    progress_bar = None
+    if show_progress:
+        progress_bar = tqdm(
+            total=file_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc="Uploading",
+        )
+        _set_upload_progress_bar(progress_bar)
+
+    try:
+        client = aai.Client.get_default()
+        http_client = client.http_client
+
+        custom_client = httpx.Client(
+            base_url=str(http_client.base_url),
+            headers=http_client.headers,
+            timeout=http_client.timeout,
+        )
+
+        with _ProgressFileReader(inpath, progress_bar) as f:
+            response = custom_client.post("/v2/upload", content=f)
+
+        if response.status_code != httpx.codes.OK:
+            raise RuntimeError(f"Upload failed: {response.text}")
+
+        upload_url = response.json()["upload_url"]
+
+        if progress_bar:
+            progress_bar.close()
+            _set_upload_progress_bar(None)
+
+        return upload_url
+
+    except Exception:
+        if progress_bar:
+            progress_bar.close()
+            _set_upload_progress_bar(None)
+        raise
+
+
 def make_transcript(
     inpath: str,
     speech_model: SpeechModelChoice,
@@ -118,8 +213,6 @@ def make_transcript(
 ) -> aai.Transcript:
     """Create a transcript with the specified configuration."""
 
-    # Build configuration
-    # Map speech model choice to aai.SpeechModel
     speech_model_map = {
         SpeechModelChoice.best: aai.SpeechModel.best,
         SpeechModelChoice.nano: aai.SpeechModel.nano,
@@ -137,44 +230,83 @@ def make_transcript(
         "auto_highlights": auto_highlights,
     }
 
-    # Language settings
     if language_code:
         config_params["language_code"] = language_code
     else:
         config_params["language_detection"] = language_detection
 
-    # Audio slicing
     if audio_start_from is not None:
         config_params["audio_start_from"] = audio_start_from
     if audio_end_at is not None:
         config_params["audio_end_at"] = audio_end_at
 
-    # Word boost
     if word_boost:
         config_params["word_boost"] = word_boost
         config_params["boost_param"] = getattr(aai.types.WordBoost, boost_param.value)
 
-    # Custom spelling
     if custom_spelling:
         config_params["custom_spelling"] = custom_spelling
 
-    # Speaker settings
     if speakers_expected is not None:
         config_params["speakers_expected"] = speakers_expected
 
     config = aai.TranscriptionConfig(**config_params)
     transcriber = aai.Transcriber(config=config)
 
+    upload_url = upload_file_with_progress(str(inpath), show_progress)
+
+    processing_bar = None
     if show_progress:
-        print(f"Uploading and transcribing {inpath}...")
-
-    transcript = transcriber.transcribe(str(inpath))
-
-    if show_progress and transcript.status == aai.TranscriptStatus.completed:
-        duration_mins = (
-            transcript.audio_duration / 60 if transcript.audio_duration else 0
+        processing_bar = tqdm(
+            total=100,
+            unit="%",
+            desc="Processing",
+            bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f}%",
         )
-        print(f"✓ Transcription complete ({duration_mins:.1f} minutes)")
+
+    transcript = transcriber.submit(upload_url)
+
+    if show_progress:
+        polling_interval = aai.settings.polling_interval
+        started_processing = False
+
+        while transcript.status not in (
+            aai.TranscriptStatus.completed,
+            aai.TranscriptStatus.error,
+        ):
+            time.sleep(polling_interval)
+
+            client = aai.Client.get_default()
+            response = client.http_client.get(f"/v2/transcript/{transcript.id}")
+            if response.status_code == 200:
+                transcript_data = response.json()
+                transcript = aai.Transcript.from_response(
+                    client=client,
+                    response=aai.types.TranscriptResponse.parse_obj(transcript_data),
+                )
+
+            if transcript.status == aai.TranscriptStatus.processing:
+                if not started_processing:
+                    started_processing = True
+                    if processing_bar:
+                        processing_bar.update(30)
+                elif processing_bar and processing_bar.n < 90:
+                    processing_bar.update(10)
+
+        if transcript.status == aai.TranscriptStatus.completed and processing_bar:
+            processing_bar.n = 100
+            processing_bar.refresh()
+
+        if processing_bar:
+            processing_bar.close()
+
+        if transcript.status == aai.TranscriptStatus.completed:
+            duration_mins = (
+                transcript.audio_duration / 60 if transcript.audio_duration else 0
+            )
+            print(f"✓ Transcription complete ({duration_mins:.1f} minutes)")
+    else:
+        transcript = transcript.wait_for_completion()
 
     return transcript
 
