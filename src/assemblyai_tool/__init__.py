@@ -13,6 +13,8 @@ import threading
 import time
 import httpx
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 app = typer.Typer()
 
@@ -43,6 +45,44 @@ class BoostParam(str, Enum):
     low = "low"
     default = "default"
     high = "high"
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".mp4",
+    ".m4a",
+    ".wav",
+    ".flac",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".webm",
+    ".wma",
+}
+
+
+@dataclass
+class TranscribeOptions:
+    """Shared transcription options"""
+
+    format: OutputFormat
+    speech_model: SpeechModelChoice
+    language_code: t.Optional[str]
+    language_detection: bool
+    audio_start_from: t.Optional[int]
+    audio_end_at: t.Optional[int]
+    punctuate: bool
+    word_boost: t.Optional[str]
+    boost_param: BoostParam
+    custom_spelling: t.Optional[str]
+    speaker_labels: bool
+    speakers_expected: t.Optional[int]
+    sentiment_analysis: bool
+    entity_detection: bool
+    auto_chapters: bool
+    auto_highlights: bool
+    show_progress: bool
+    estimate_cost_only: bool
 
 
 def load_api_key() -> None:
@@ -354,6 +394,81 @@ def format_output(
         return transcript.text
 
 
+def process_single_file(
+    inpath: Path,
+    outpath: Path,
+    opts: TranscribeOptions,
+) -> None:
+    """Process a single audio file with the given options."""
+    word_boost_list = None
+    if opts.word_boost:
+        word_boost_list = [w.strip() for w in opts.word_boost.split(",")]
+
+    custom_spelling_dict = None
+    if opts.custom_spelling:
+        custom_spelling_dict = parse_custom_spelling(opts.custom_spelling)
+
+    if opts.estimate_cost_only:
+        print("Cost estimation requires file duration. Typical rates:")
+        print("  Base transcription: $0.015/minute")
+        print("  Speaker labels: +$0.004/minute")
+        print("  Content analysis features: +$0.002/minute each")
+        features = {
+            "speaker_labels": opts.speaker_labels,
+            "sentiment_analysis": opts.sentiment_analysis,
+            "entity_detection": opts.entity_detection,
+            "auto_chapters": opts.auto_chapters,
+            "auto_highlights": opts.auto_highlights,
+        }
+        enabled_features = [k for k, v in features.items() if v]
+        if enabled_features:
+            print(f"  Enabled features: {', '.join(enabled_features)}")
+        return
+
+    transcript = make_transcript(
+        inpath=str(inpath),
+        speech_model=opts.speech_model,
+        language_code=opts.language_code,
+        language_detection=opts.language_detection,
+        audio_start_from=opts.audio_start_from,
+        audio_end_at=opts.audio_end_at,
+        punctuate=opts.punctuate,
+        word_boost=word_boost_list,
+        boost_param=opts.boost_param,
+        custom_spelling=custom_spelling_dict,
+        speaker_labels=opts.speaker_labels,
+        speakers_expected=opts.speakers_expected,
+        sentiment_analysis=opts.sentiment_analysis,
+        entity_detection=opts.entity_detection,
+        auto_chapters=opts.auto_chapters,
+        auto_highlights=opts.auto_highlights,
+        show_progress=opts.show_progress,
+    )
+
+    if transcript.status == aai.TranscriptStatus.error:
+        print(f"Error: {transcript.error}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if opts.show_progress and transcript.audio_duration:
+        features = {
+            "speaker_labels": opts.speaker_labels,
+            "sentiment_analysis": opts.sentiment_analysis,
+            "entity_detection": opts.entity_detection,
+            "auto_chapters": opts.auto_chapters,
+            "auto_highlights": opts.auto_highlights,
+        }
+        estimated_cost = estimate_cost(transcript.audio_duration, features)
+        print(f"Estimated cost: ${estimated_cost:.4f}")
+
+    output_text = format_output(transcript, opts.format, opts.speaker_labels)
+
+    if opts.show_progress:
+        print(f"Saving to {outpath}")
+
+    with open(outpath, "w") as f:
+        f.write(output_text)
+
+
 @app.command()
 def convert(
     inpath: t.Annotated[
@@ -427,22 +542,147 @@ def convert(
     ] = False,
 ) -> None:
     """Convert a media file to text with various transcription options."""
+    opts = TranscribeOptions(
+        format=format,
+        speech_model=speech_model,
+        language_code=language_code,
+        language_detection=language_detection,
+        audio_start_from=audio_start_from,
+        audio_end_at=audio_end_at,
+        punctuate=punctuate,
+        word_boost=word_boost,
+        boost_param=boost_param,
+        custom_spelling=custom_spelling,
+        speaker_labels=speaker_labels,
+        speakers_expected=speakers_expected,
+        sentiment_analysis=sentiment_analysis,
+        entity_detection=entity_detection,
+        auto_chapters=auto_chapters,
+        auto_highlights=auto_highlights,
+        show_progress=show_progress,
+        estimate_cost_only=estimate_cost_only,
+    )
+    process_single_file(inpath, outpath, opts)
 
-    # Parse word boost
-    word_boost_list = None
-    if word_boost:
-        word_boost_list = [w.strip() for w in word_boost.split(",")]
 
-    # Parse custom spelling
-    custom_spelling_dict = None
-    if custom_spelling:
-        custom_spelling_dict = parse_custom_spelling(custom_spelling)
+@app.command()
+def batch(
+    input_dir: t.Annotated[
+        Path, typer.Argument(exists=True, file_okay=False, help="Input directory")
+    ],
+    output_dir: t.Annotated[Path, typer.Argument(help="Output directory")],
+    upload_concurrency: t.Annotated[
+        int, typer.Option(help="Number of concurrent uploads")
+    ] = 1,
+    processing_concurrency: t.Annotated[
+        int, typer.Option(help="Number of concurrent processing jobs")
+    ] = 8,
+    format: t.Annotated[
+        OutputFormat, typer.Option(help="Output format")
+    ] = OutputFormat.utterances,
+    speech_model: t.Annotated[
+        SpeechModelChoice, typer.Option(help="Speech model to use")
+    ] = SpeechModelChoice.best,
+    language_code: t.Annotated[
+        t.Optional[str],
+        typer.Option(
+            help="Language code (e.g., en, es, fr). Overrides language-detection"
+        ),
+    ] = None,
+    language_detection: t.Annotated[
+        bool, typer.Option(help="Enable automatic language detection")
+    ] = False,
+    audio_start_from: t.Annotated[
+        t.Optional[int], typer.Option(help="Start transcription from this millisecond")
+    ] = None,
+    audio_end_at: t.Annotated[
+        t.Optional[int], typer.Option(help="End transcription at this millisecond")
+    ] = None,
+    punctuate: t.Annotated[
+        bool, typer.Option(help="Enable automatic punctuation")
+    ] = True,
+    word_boost: t.Annotated[
+        t.Optional[str],
+        typer.Option(help="Comma-separated list of words/phrases to boost accuracy"),
+    ] = None,
+    boost_param: t.Annotated[
+        BoostParam, typer.Option(help="Weight to apply to boosted words")
+    ] = BoostParam.default,
+    custom_spelling: t.Annotated[
+        t.Optional[str],
+        typer.Option(help="Custom spelling mappings (format: 'from1:to1,from2:to2')"),
+    ] = None,
+    speaker_labels: t.Annotated[
+        bool, typer.Option(help="Enable speaker diarization")
+    ] = False,
+    speakers_expected: t.Annotated[
+        t.Optional[int], typer.Option(help="Expected number of speakers (2-10)")
+    ] = None,
+    sentiment_analysis: t.Annotated[
+        bool, typer.Option(help="Enable sentiment analysis")
+    ] = False,
+    entity_detection: t.Annotated[
+        bool, typer.Option(help="Enable entity detection")
+    ] = False,
+    auto_chapters: t.Annotated[bool, typer.Option(help="Enable auto chapters")] = False,
+    auto_highlights: t.Annotated[
+        bool, typer.Option(help="Enable auto highlights")
+    ] = False,
+    show_progress: t.Annotated[
+        bool, typer.Option(help="Show progress messages")
+    ] = True,
+    estimate_cost_only: t.Annotated[
+        bool, typer.Option("--estimate-cost", help="Estimate cost without transcribing")
+    ] = False,
+) -> None:
+    """Batch convert audio files from input directory to output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Cost estimation
+    audio_files = [
+        f
+        for f in input_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+
+    if not audio_files:
+        print("No audio files found in input directory")
+        return
+
+    opts = TranscribeOptions(
+        format=format,
+        speech_model=speech_model,
+        language_code=language_code,
+        language_detection=language_detection,
+        audio_start_from=audio_start_from,
+        audio_end_at=audio_end_at,
+        punctuate=punctuate,
+        word_boost=word_boost,
+        boost_param=boost_param,
+        custom_spelling=custom_spelling,
+        speaker_labels=speaker_labels,
+        speakers_expected=speakers_expected,
+        sentiment_analysis=sentiment_analysis,
+        entity_detection=entity_detection,
+        auto_chapters=auto_chapters,
+        auto_highlights=auto_highlights,
+        show_progress=False,
+        estimate_cost_only=estimate_cost_only,
+    )
+
+    output_ext_map = {
+        OutputFormat.text: ".txt",
+        OutputFormat.paragraphs: ".txt",
+        OutputFormat.utterances: ".txt",
+        OutputFormat.srt: ".srt",
+        OutputFormat.vtt: ".vtt",
+        OutputFormat.json_format: ".json",
+    }
+    output_ext = output_ext_map[format]
+
+    file_pairs = [(f, output_dir / f"{f.stem}{output_ext}") for f in audio_files]
+
     if estimate_cost_only:
-        # Get file info for rough estimate
-        # For audio files, we'd need to actually probe the duration
-        # For now, provide a message
+        print(f"Found {len(file_pairs)} audio files to process")
         print("Cost estimation requires file duration. Typical rates:")
         print("  Base transcription: $0.015/minute")
         print("  Speaker labels: +$0.004/minute")
@@ -459,52 +699,147 @@ def convert(
             print(f"  Enabled features: {', '.join(enabled_features)}")
         return
 
-    # Create transcript
-    transcript = make_transcript(
-        inpath=str(inpath),
-        speech_model=speech_model,
-        language_code=language_code,
-        language_detection=language_detection,
-        audio_start_from=audio_start_from,
-        audio_end_at=audio_end_at,
-        punctuate=punctuate,
-        word_boost=word_boost_list,
-        boost_param=boost_param,
-        custom_spelling=custom_spelling_dict,
-        speaker_labels=speaker_labels,
-        speakers_expected=speakers_expected,
-        sentiment_analysis=sentiment_analysis,
-        entity_detection=entity_detection,
-        auto_chapters=auto_chapters,
-        auto_highlights=auto_highlights,
-        show_progress=show_progress,
+    upload_semaphore = threading.Semaphore(upload_concurrency)
+    processing_semaphore = threading.Semaphore(processing_concurrency)
+
+    uploading_count = 0
+    processing_count = 0
+    completed_count = 0
+    failed_count = 0
+    count_lock = threading.Lock()
+
+    def update_progress_desc():
+        with count_lock:
+            return f"{uploading_count} u/l; {processing_count} asr"
+
+    progress_bar = (
+        tqdm(total=len(file_pairs), desc="", unit="file") if show_progress else None
     )
 
-    # Check for errors
-    if transcript.status == aai.TranscriptStatus.error:
-        print(f"Error: {transcript.error}", file=sys.stderr)
-        raise typer.Exit(1)
+    def process_file(inpath: Path, outpath: Path):
+        nonlocal uploading_count, processing_count, completed_count, failed_count
 
-    # Show actual cost estimate
-    if show_progress and transcript.audio_duration:
-        features = {
-            "speaker_labels": speaker_labels,
-            "sentiment_analysis": sentiment_analysis,
-            "entity_detection": entity_detection,
-            "auto_chapters": auto_chapters,
-            "auto_highlights": auto_highlights,
-        }
-        estimated_cost = estimate_cost(transcript.audio_duration, features)
-        print(f"Estimated cost: ${estimated_cost:.4f}")
+        try:
+            with upload_semaphore:
+                with count_lock:
+                    uploading_count += 1
+                if progress_bar:
+                    progress_bar.set_postfix_str(update_progress_desc())
 
-    # Format and save output
-    output_text = format_output(transcript, format, speaker_labels)
+                upload_url = upload_file_with_progress(str(inpath), False)
+
+                with count_lock:
+                    uploading_count -= 1
+                    processing_count += 1
+                if progress_bar:
+                    progress_bar.set_postfix_str(update_progress_desc())
+
+            with processing_semaphore:
+                word_boost_list = None
+                if opts.word_boost:
+                    word_boost_list = [w.strip() for w in opts.word_boost.split(",")]
+
+                custom_spelling_dict = None
+                if opts.custom_spelling:
+                    custom_spelling_dict = parse_custom_spelling(opts.custom_spelling)
+
+                speech_model_map = {
+                    SpeechModelChoice.best: aai.SpeechModel.best,
+                    SpeechModelChoice.nano: aai.SpeechModel.nano,
+                    SpeechModelChoice.slam_1: aai.SpeechModel.slam_1,
+                    SpeechModelChoice.universal: aai.SpeechModel.universal,
+                }
+
+                config_params = {
+                    "speech_model": speech_model_map[opts.speech_model],
+                    "punctuate": opts.punctuate,
+                    "speaker_labels": opts.speaker_labels,
+                    "sentiment_analysis": opts.sentiment_analysis,
+                    "entity_detection": opts.entity_detection,
+                    "auto_chapters": opts.auto_chapters,
+                    "auto_highlights": opts.auto_highlights,
+                }
+
+                if opts.language_code:
+                    config_params["language_code"] = opts.language_code
+                else:
+                    config_params["language_detection"] = opts.language_detection
+
+                if opts.audio_start_from is not None:
+                    config_params["audio_start_from"] = opts.audio_start_from
+                if opts.audio_end_at is not None:
+                    config_params["audio_end_at"] = opts.audio_end_at
+
+                if word_boost_list:
+                    config_params["word_boost"] = word_boost_list
+                    config_params["boost_param"] = getattr(
+                        aai.types.WordBoost, opts.boost_param.value
+                    )
+
+                if custom_spelling_dict:
+                    config_params["custom_spelling"] = custom_spelling_dict
+
+                if opts.speakers_expected is not None:
+                    config_params["speakers_expected"] = opts.speakers_expected
+
+                config = aai.TranscriptionConfig(**config_params)
+                transcriber = aai.Transcriber(config=config)
+
+                transcript = transcriber.submit(upload_url)
+                transcript = transcript.wait_for_completion()
+
+                with count_lock:
+                    processing_count -= 1
+                if progress_bar:
+                    progress_bar.set_postfix_str(update_progress_desc())
+
+                if transcript.status == aai.TranscriptStatus.error:
+                    with count_lock:
+                        failed_count += 1
+                    if progress_bar:
+                        progress_bar.write(
+                            f"Error processing {inpath.name}: {transcript.error}"
+                        )
+                    return
+
+                output_text = format_output(
+                    transcript, opts.format, opts.speaker_labels
+                )
+                with open(outpath, "w") as f:
+                    f.write(output_text)
+
+                with count_lock:
+                    completed_count += 1
+                if progress_bar:
+                    progress_bar.update(1)
+
+        except Exception as e:
+            with count_lock:
+                failed_count += 1
+                if uploading_count > 0:
+                    uploading_count -= 1
+                if processing_count > 0:
+                    processing_count -= 1
+            if progress_bar:
+                progress_bar.write(f"Error processing {inpath.name}: {e}")
+
+    with ThreadPoolExecutor(
+        max_workers=upload_concurrency + processing_concurrency
+    ) as executor:
+        futures = [
+            executor.submit(process_file, inpath, outpath)
+            for inpath, outpath in file_pairs
+        ]
+        for future in futures:
+            future.result()
+
+    if progress_bar:
+        progress_bar.close()
 
     if show_progress:
-        print(f"Saving to {outpath}")
-
-    with open(outpath, "w") as f:
-        f.write(output_text)
+        print(f"\nCompleted: {completed_count}/{len(file_pairs)}")
+        if failed_count > 0:
+            print(f"Failed: {failed_count}")
 
 
 @app.command()
