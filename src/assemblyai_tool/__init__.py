@@ -517,6 +517,9 @@ def batch(
     processing_concurrency: t.Annotated[
         int, typer.Option(help="Number of concurrent processing jobs")
     ] = 8,
+    force: t.Annotated[
+        bool, typer.Option("--force", "-f", help="Overwrite existing output files")
+    ] = False,
     format: t.Annotated[
         OutputFormat, typer.Option(help="Output format")
     ] = OutputFormat.utterances,
@@ -616,6 +619,23 @@ def batch(
     output_ext = output_ext_map[format]
 
     file_pairs = [(f, output_dir / f"{f.stem}{output_ext}") for f in audio_files]
+
+    if not force:
+        skipped_files = [
+            (inpath, outpath) for inpath, outpath in file_pairs if outpath.exists()
+        ]
+        file_pairs = [
+            (inpath, outpath) for inpath, outpath in file_pairs if not outpath.exists()
+        ]
+
+        if skipped_files and show_progress:
+            print(
+                f"Skipping {len(skipped_files)} existing file(s) (use --force to overwrite)"
+            )
+
+    if not file_pairs:
+        print("No files to process")
+        return
 
     upload_semaphore = threading.Semaphore(upload_concurrency)
     processing_semaphore = threading.Semaphore(processing_concurrency)
