@@ -82,7 +82,6 @@ class TranscribeOptions:
     auto_chapters: bool
     auto_highlights: bool
     show_progress: bool
-    estimate_cost_only: bool
 
 
 def load_api_key() -> None:
@@ -97,33 +96,6 @@ def load_api_key() -> None:
         if vars.get("ASSEMBLY_AI_KEY"):
             return vars["ASSEMBLY_AI_KEY"]
     raise RuntimeError("No API key found")
-
-
-def estimate_cost(audio_duration_seconds: float, features: dict) -> float:
-    """Estimate the cost of transcription in USD.
-
-    Base rates (as of 2024):
-    - Standard transcription: $0.00025/second ($0.015/minute)
-    - Additional features add to base cost
-    """
-    base_cost = audio_duration_seconds * 0.00025
-
-    # Features that add cost (rough estimates)
-    additional_cost = 0.0
-    if features.get("speaker_labels"):
-        additional_cost += audio_duration_seconds * 0.00006
-    if features.get("sentiment_analysis"):
-        additional_cost += audio_duration_seconds * 0.00003
-    if features.get("entity_detection"):
-        additional_cost += audio_duration_seconds * 0.00003
-    if features.get("auto_chapters"):
-        additional_cost += audio_duration_seconds * 0.00003
-    if features.get("auto_highlights"):
-        additional_cost += audio_duration_seconds * 0.00003
-    if features.get("summarization"):
-        additional_cost += audio_duration_seconds * 0.00003
-
-    return base_cost + additional_cost
 
 
 def parse_custom_spelling(spelling_str: str) -> dict:
@@ -408,23 +380,6 @@ def process_single_file(
     if opts.custom_spelling:
         custom_spelling_dict = parse_custom_spelling(opts.custom_spelling)
 
-    if opts.estimate_cost_only:
-        print("Cost estimation requires file duration. Typical rates:")
-        print("  Base transcription: $0.015/minute")
-        print("  Speaker labels: +$0.004/minute")
-        print("  Content analysis features: +$0.002/minute each")
-        features = {
-            "speaker_labels": opts.speaker_labels,
-            "sentiment_analysis": opts.sentiment_analysis,
-            "entity_detection": opts.entity_detection,
-            "auto_chapters": opts.auto_chapters,
-            "auto_highlights": opts.auto_highlights,
-        }
-        enabled_features = [k for k, v in features.items() if v]
-        if enabled_features:
-            print(f"  Enabled features: {', '.join(enabled_features)}")
-        return
-
     transcript = make_transcript(
         inpath=str(inpath),
         speech_model=opts.speech_model,
@@ -448,17 +403,6 @@ def process_single_file(
     if transcript.status == aai.TranscriptStatus.error:
         print(f"Error: {transcript.error}", file=sys.stderr)
         raise typer.Exit(1)
-
-    if opts.show_progress and transcript.audio_duration:
-        features = {
-            "speaker_labels": opts.speaker_labels,
-            "sentiment_analysis": opts.sentiment_analysis,
-            "entity_detection": opts.entity_detection,
-            "auto_chapters": opts.auto_chapters,
-            "auto_highlights": opts.auto_highlights,
-        }
-        estimated_cost = estimate_cost(transcript.audio_duration, features)
-        print(f"Estimated cost: ${estimated_cost:.4f}")
 
     output_text = format_output(transcript, opts.format, opts.speaker_labels)
 
@@ -537,9 +481,6 @@ def convert(
     show_progress: t.Annotated[
         bool, typer.Option(help="Show progress messages")
     ] = True,
-    estimate_cost_only: t.Annotated[
-        bool, typer.Option("--estimate-cost", help="Estimate cost without transcribing")
-    ] = False,
 ) -> None:
     """Convert a media file to text with various transcription options."""
     opts = TranscribeOptions(
@@ -560,7 +501,6 @@ def convert(
         auto_chapters=auto_chapters,
         auto_highlights=auto_highlights,
         show_progress=show_progress,
-        estimate_cost_only=estimate_cost_only,
     )
     process_single_file(inpath, outpath, opts)
 
@@ -631,9 +571,6 @@ def batch(
     show_progress: t.Annotated[
         bool, typer.Option(help="Show progress messages")
     ] = True,
-    estimate_cost_only: t.Annotated[
-        bool, typer.Option("--estimate-cost", help="Estimate cost without transcribing")
-    ] = False,
 ) -> None:
     """Batch convert audio files from input directory to output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -666,7 +603,6 @@ def batch(
         auto_chapters=auto_chapters,
         auto_highlights=auto_highlights,
         show_progress=False,
-        estimate_cost_only=estimate_cost_only,
     )
 
     output_ext_map = {
@@ -680,24 +616,6 @@ def batch(
     output_ext = output_ext_map[format]
 
     file_pairs = [(f, output_dir / f"{f.stem}{output_ext}") for f in audio_files]
-
-    if estimate_cost_only:
-        print(f"Found {len(file_pairs)} audio files to process")
-        print("Cost estimation requires file duration. Typical rates:")
-        print("  Base transcription: $0.015/minute")
-        print("  Speaker labels: +$0.004/minute")
-        print("  Content analysis features: +$0.002/minute each")
-        features = {
-            "speaker_labels": speaker_labels,
-            "sentiment_analysis": sentiment_analysis,
-            "entity_detection": entity_detection,
-            "auto_chapters": auto_chapters,
-            "auto_highlights": auto_highlights,
-        }
-        enabled_features = [k for k, v in features.items() if v]
-        if enabled_features:
-            print(f"  Enabled features: {', '.join(enabled_features)}")
-        return
 
     upload_semaphore = threading.Semaphore(upload_concurrency)
     processing_semaphore = threading.Semaphore(processing_concurrency)
