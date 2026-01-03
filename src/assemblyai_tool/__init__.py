@@ -82,6 +82,8 @@ class TranscribeOptions:
     auto_chapters: bool
     auto_highlights: bool
     show_progress: bool
+    rate_limit_kbps: float
+    rate_limit_ratio: t.Optional[float]
 
 
 def load_api_key() -> None:
@@ -126,19 +128,103 @@ def _set_upload_progress_bar(bar: t.Optional[tqdm]) -> None:
     _upload_progress_bars.bar = bar
 
 
+class _RateLimiter:
+    """Rate limiter supporting fixed kbps limit or ratio of first upload speed."""
+
+    def __init__(self, rate_limit_kbps: float, rate_limit_ratio: t.Optional[float]):
+        self.rate_limit_kbps = rate_limit_kbps
+        self.rate_limit_ratio = rate_limit_ratio
+        self.first_upload_speed_kbps = None
+        self.lock = threading.Lock()
+        self.effective_limit_kbps = None
+
+    def set_first_upload_speed(self, speed_kbps: float) -> None:
+        """Set the speed observed during first upload."""
+        with self.lock:
+            if self.first_upload_speed_kbps is None:
+                self.first_upload_speed_kbps = speed_kbps
+                if self.rate_limit_ratio is not None:
+                    self.effective_limit_kbps = speed_kbps * self.rate_limit_ratio
+
+    def get_delay_for_bytes(self, num_bytes: int) -> float:
+        """Calculate delay needed for given byte count based on current rate limit."""
+        with self.lock:
+            limit_kbps = self.rate_limit_kbps
+            if limit_kbps == 0 and self.effective_limit_kbps is not None:
+                limit_kbps = self.effective_limit_kbps
+
+            if limit_kbps == 0:
+                return 0.0
+
+            bytes_per_second = limit_kbps * 1024
+            return num_bytes / bytes_per_second
+
+    def get_limit_mbps(self) -> t.Optional[float]:
+        """Get current effective rate limit in Mbps for display."""
+        with self.lock:
+            limit_kbps = self.rate_limit_kbps
+            if limit_kbps == 0 and self.effective_limit_kbps is not None:
+                limit_kbps = self.effective_limit_kbps
+
+            if limit_kbps == 0:
+                return None
+
+            return limit_kbps / 1024
+
+
 class _ProgressFileReader:
     """Wrapper that tracks read progress for file uploads."""
 
-    def __init__(self, file_path: str, progress_bar: t.Optional[tqdm]):
+    def __init__(
+        self,
+        file_path: str,
+        progress_bar: t.Optional[tqdm],
+        rate_limiter: t.Optional[_RateLimiter] = None,
+        is_first_upload: bool = False,
+    ):
         self.file = open(file_path, "rb")
         self.progress_bar = progress_bar
         self.size = os.path.getsize(file_path)
+        self.rate_limiter = rate_limiter
+        self.is_first_upload = is_first_upload
+        self.total_bytes_read = 0
+        self.start_time = time.time()
 
     def read(self, size: int = -1) -> bytes:
         data = self.file.read(size)
-        if self.progress_bar and data:
+        if not data:
+            return data
+
+        self.total_bytes_read += len(data)
+
+        if self.rate_limiter and not self.is_first_upload:
+            delay = self.rate_limiter.get_delay_for_bytes(len(data))
+            if delay > 0:
+                time.sleep(delay)
+
+        if self.progress_bar:
             self.progress_bar.update(len(data))
+            self._update_display()
+
         return data
+
+    def _update_display(self):
+        """Update progress bar with rate limit information."""
+        if not self.progress_bar:
+            return
+
+        if self.rate_limiter:
+            limit_mbps = self.rate_limiter.get_limit_mbps()
+            if limit_mbps is not None:
+                self.progress_bar.set_postfix_str(f"{limit_mbps:.1f}M lmt")
+
+    def get_upload_speed_kbps(self) -> float:
+        """Calculate average upload speed in kbps."""
+        elapsed = time.time() - self.start_time
+        if elapsed == 0:
+            return 0.0
+        bytes_per_second = self.total_bytes_read / elapsed
+        return bytes_per_second / 1024
 
     def __iter__(self):
         chunk_size = 8192
@@ -158,8 +244,18 @@ class _ProgressFileReader:
         self.close()
 
 
-def upload_file_with_progress(inpath: str, show_progress: bool) -> str:
-    """Upload a file to AssemblyAI with progress tracking."""
+def upload_file_with_progress(
+    inpath: str,
+    show_progress: bool,
+    rate_limit_kbps: float = 0.0,
+    rate_limit_ratio: t.Optional[float] = None,
+    is_first_upload: bool = False,
+    shared_rate_limiter: t.Optional[_RateLimiter] = None,
+) -> t.Tuple[str, float]:
+    """Upload a file to AssemblyAI with progress tracking.
+
+    Returns tuple of (upload_url, speed_kbps).
+    """
     file_size = os.path.getsize(inpath)
 
     progress_bar = None
@@ -173,6 +269,10 @@ def upload_file_with_progress(inpath: str, show_progress: bool) -> str:
         )
         _set_upload_progress_bar(progress_bar)
 
+    rate_limiter = shared_rate_limiter
+    if rate_limiter is None and (rate_limit_kbps > 0 or rate_limit_ratio is not None):
+        rate_limiter = _RateLimiter(rate_limit_kbps, rate_limit_ratio)
+
     try:
         client = aai.Client.get_default()
         http_client = client.http_client
@@ -183,8 +283,11 @@ def upload_file_with_progress(inpath: str, show_progress: bool) -> str:
             timeout=http_client.timeout,
         )
 
-        with _ProgressFileReader(inpath, progress_bar) as f:
+        with _ProgressFileReader(
+            inpath, progress_bar, rate_limiter, is_first_upload
+        ) as f:
             response = custom_client.post("/v2/upload", content=f)
+            upload_speed_kbps = f.get_upload_speed_kbps()
 
         if response.status_code != httpx.codes.OK:
             raise RuntimeError(f"Upload failed: {response.text}")
@@ -195,7 +298,7 @@ def upload_file_with_progress(inpath: str, show_progress: bool) -> str:
             progress_bar.close()
             _set_upload_progress_bar(None)
 
-        return upload_url
+        return upload_url, upload_speed_kbps
 
     except Exception:
         if progress_bar:
@@ -222,6 +325,8 @@ def make_transcript(
     auto_chapters: bool,
     auto_highlights: bool,
     show_progress: bool,
+    rate_limit_kbps: float = 0.0,
+    rate_limit_ratio: t.Optional[float] = None,
 ) -> aai.Transcript:
     """Create a transcript with the specified configuration."""
 
@@ -265,7 +370,9 @@ def make_transcript(
     config = aai.TranscriptionConfig(**config_params)
     transcriber = aai.Transcriber(config=config)
 
-    upload_url = upload_file_with_progress(str(inpath), show_progress)
+    upload_url, _ = upload_file_with_progress(
+        str(inpath), show_progress, rate_limit_kbps, rate_limit_ratio
+    )
 
     processing_bar = None
     if show_progress:
@@ -398,6 +505,8 @@ def process_single_file(
         auto_chapters=opts.auto_chapters,
         auto_highlights=opts.auto_highlights,
         show_progress=opts.show_progress,
+        rate_limit_kbps=opts.rate_limit_kbps,
+        rate_limit_ratio=opts.rate_limit_ratio,
     )
 
     if transcript.status == aai.TranscriptStatus.error:
@@ -481,6 +590,10 @@ def convert(
     show_progress: t.Annotated[
         bool, typer.Option(help="Show progress messages")
     ] = True,
+    rate_limit_kbps: t.Annotated[
+        float,
+        typer.Option(help="Rate limit in kbps (0 = no limit)"),
+    ] = 0.0,
 ) -> None:
     """Convert a media file to text with various transcription options."""
     opts = TranscribeOptions(
@@ -501,6 +614,8 @@ def convert(
         auto_chapters=auto_chapters,
         auto_highlights=auto_highlights,
         show_progress=show_progress,
+        rate_limit_kbps=rate_limit_kbps,
+        rate_limit_ratio=None,
     )
     process_single_file(inpath, outpath, opts)
 
@@ -574,8 +689,25 @@ def batch(
     show_progress: t.Annotated[
         bool, typer.Option(help="Show progress messages")
     ] = True,
+    rate_limit_kbps: t.Annotated[
+        float,
+        typer.Option(help="Rate limit in kbps (0 = no limit)"),
+    ] = 0.0,
+    rate_limit_ratio: t.Annotated[
+        float,
+        typer.Option(
+            help="Rate limit ratio of first upload speed (0.0-1.0, 1.0 = no limit)"
+        ),
+    ] = 1.0,
 ) -> None:
     """Batch convert audio files from input directory to output directory."""
+    if rate_limit_ratio <= 0 or rate_limit_ratio > 1.0:
+        print(
+            "Error: --rate-limit-ratio must be between 0 (exclusive) and 1.0",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     audio_files = [
@@ -606,6 +738,8 @@ def batch(
         auto_chapters=auto_chapters,
         auto_highlights=auto_highlights,
         show_progress=False,
+        rate_limit_kbps=rate_limit_kbps,
+        rate_limit_ratio=rate_limit_ratio if rate_limit_ratio < 1.0 else None,
     )
 
     output_ext_map = {
@@ -645,6 +779,10 @@ def batch(
     completed_count = 0
     failed_count = 0
     count_lock = threading.Lock()
+    first_upload_done = False
+    rate_limiter_shared = None
+    if opts.rate_limit_kbps > 0 or opts.rate_limit_ratio is not None:
+        rate_limiter_shared = _RateLimiter(opts.rate_limit_kbps, opts.rate_limit_ratio)
 
     def update_progress_desc():
         with count_lock:
@@ -655,20 +793,38 @@ def batch(
     )
 
     def process_file(inpath: Path, outpath: Path):
-        nonlocal uploading_count, processing_count, completed_count, failed_count
+        nonlocal \
+            uploading_count, \
+            processing_count, \
+            completed_count, \
+            failed_count, \
+            first_upload_done
 
         try:
             with upload_semaphore:
                 with count_lock:
                     uploading_count += 1
+                    is_first = not first_upload_done
                 if progress_bar:
                     progress_bar.set_postfix_str(update_progress_desc())
 
-                upload_url = upload_file_with_progress(str(inpath), False)
+                upload_url, speed_kbps = upload_file_with_progress(
+                    str(inpath),
+                    False,
+                    opts.rate_limit_kbps,
+                    opts.rate_limit_ratio,
+                    is_first,
+                    rate_limiter_shared,
+                )
+
+                if is_first and rate_limiter_shared:
+                    rate_limiter_shared.set_first_upload_speed(speed_kbps)
 
                 with count_lock:
                     uploading_count -= 1
                     processing_count += 1
+                    if is_first:
+                        first_upload_done = True
                 if progress_bar:
                     progress_bar.set_postfix_str(update_progress_desc())
 
