@@ -1,6 +1,6 @@
 [project]
 name = "assemblyai-tool"
-version = "0.2.1"
+version = "0.3.0"
 description = "Simple CLI wrapper around the AssemblyAI Python SDK"
 readme = "README.md"
 authors = [
@@ -8,11 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "assemblyai>=0.36.0",
+    "assemblyai>=0.48.4",
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
     "tqdm>=4.67.1",
-    "typer>=0.15.1",
+    "typer>=0.21.0",
 ]
 
 [project.scripts]
