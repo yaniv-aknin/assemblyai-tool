@@ -1,0 +1,8 @@
+{
+  "name": "demoya/assemblyai-tool",
+  "version": "0.3.2",
+  "docs": "docs/index.md",
+  "describes": "pkg:pypi/assemblyai-tool@0.3.2",
+  "summary": "Simple CLI wrapper around the AssemblyAI Python SDK for audio and video transcription",
+  "private": true
+}

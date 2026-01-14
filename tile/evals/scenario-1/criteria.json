@@ -1,0 +1,51 @@
+{
+  "context": "This criteria evaluates how effectively the engineer uses the assemblyai-tool package to implement a batch transcription solution. The focus is on correctly utilizing the package's batch command with appropriate concurrency controls, rate limiting, vocabulary boosting, and speaker identification features.",
+  "type": "weighted_checklist",
+  "checklist": [
+    {
+      "name": "Batch command usage",
+      "description": "Uses the 'aait batch' command (or equivalent batch functionality from the assemblyai-tool package) to process multiple audio files from the input directory to the output directory",
+      "max_score": 20
+    },
+    {
+      "name": "Upload concurrency",
+      "description": "Configures upload concurrency to 3 concurrent uploads using the --upload-concurrency parameter",
+      "max_score": 10
+    },
+    {
+      "name": "Processing concurrency",
+      "description": "Configures processing concurrency to 8 concurrent jobs using the --processing-concurrency parameter",
+      "max_score": 10
+    },
+    {
+      "name": "Ratio-based rate limiting",
+      "description": "Implements bandwidth control using --rate-limit-ratio parameter set to 0.6 (60% of initial upload speed)",
+      "max_score": 15
+    },
+    {
+      "name": "Custom vocabulary",
+      "description": "Provides vocabulary boost for the specified technical terms (Kubernetes, Python, Docker, TypeScript) using the --word-boost parameter with comma-separated values",
+      "max_score": 15
+    },
+    {
+      "name": "Boost strength",
+      "description": "Sets boost parameter to 'high' strength using the --boost-param parameter",
+      "max_score": 10
+    },
+    {
+      "name": "Speaker labels",
+      "description": "Enables speaker identification using the --speaker-labels flag or parameter",
+      "max_score": 10
+    },
+    {
+      "name": "Output format",
+      "description": "Specifies plain text format using the --format parameter set to 'text'",
+      "max_score": 5
+    },
+    {
+      "name": "Skip existing files",
+      "description": "Configures the script to skip already-transcribed files (either by omitting --force flag, or using package's default skip behavior)",
+      "max_score": 5
+    }
+  ]
+}
